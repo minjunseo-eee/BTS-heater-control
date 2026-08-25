@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>4채널 MAX31856 배선도</title>
+<style>
+  :root {
+    --surface: #ffffff;
+    --ink-primary: #1a202c;
+    --ink-secondary: #4a5568;
+    --ink-muted: #718096;
+    --line: #a0aec0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px 24px;
+    background: var(--surface);
+    font-family: "Pretendard", "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    color: var(--ink-primary);
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 700; margin: 0 0 4px 0; text-align: center; }
+  .subtitle { text-align: center; color: var(--ink-muted); font-size: 13px; margin: 0 0 28px 0; }
+  svg { display: block; width: 100%; height: auto; }
+  .pin-label { font-size: 11.5px; fill: var(--ink-primary); font-weight: 600; }
+  .pin-sub { font-size: 10px; fill: var(--ink-muted); }
+  .mod-title { font-size: 13px; font-weight: 700; fill: var(--ink-primary); }
+  .mod-pin { font-size: 10px; fill: var(--ink-secondary); }
+  .section-tag { font-size: 12px; font-weight: 700; fill: var(--ink-secondary); }
+  .legend { display: flex; justify-content: center; gap: 22px; margin-top: 24px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink-secondary); }
+  .swatch { width: 22px; height: 4px; border-radius: 2px; flex-shrink: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>MAX31856 4채널 배선도 — Raspberry Pi</h1>
+  <p class="subtitle">VIN·GND·SCK·SDI·SDO는 4개 모듈이 공유(병렬) / CS는 모듈마다 독립 GPIO 사용</p>
+
+  <svg viewBox="0 0 1220 760" xmlns="http://www.w3.org/2000/svg">
+
+    <!-- ===== Raspberry Pi header block ===== -->
+    <text x="150" y="34" text-anchor="middle" class="section-tag">Raspberry Pi 40핀 헤더 (사용 핀만 표시)</text>
+    <rect x="30" y="50" width="240" height="640" rx="10" fill="#f7fafc" stroke="#cbd5e0" stroke-width="1.5"/>
+
+    <!-- pin rows -->
+    <!-- y positions -->
+    <!-- 3.3V:100 GND:170 SCK:240 SDI(MOSI):310 SDO(MISO):380 CS1:470 CS2:540 CS3:610 CS4:680 -->
+
+    <g>
+      <circle cx="60" cy="100" r="6" fill="#e53e3e"/>
+      <text x="78" y="97" class="pin-label">3.3V (전원)</text>
+      <text x="78" y="112" class="pin-sub">물리핀 1번 또는 17번</text>
+    </g>
+    <g>
+      <circle cx="60" cy="170" r="6" fill="#1a202c"/>
+      <text x="78" y="167" class="pin-label">GND</text>
+      <text x="78" y="182" class="pin-sub">물리핀 6/9/14/20... 등</text>
+    </g>
+    <g>
+      <circle cx="60" cy="240" r="6" fill="#d69e2e"/>
+      <text x="78" y="237" class="pin-label">SCK (SCLK)</text>
+      <text x="78" y="252" class="pin-sub">GPIO11 · 물리핀 23번</text>
+    </g>
+    <g>
+      <circle cx="60" cy="310" r="6" fill="#3182ce"/>
+      <text x="78" y="307" class="pin-label">SDI (MOSI)</text>
+      <text x="78" y="322" class="pin-sub">GPIO10 · 물리핀 19번</text>
+    </g>
+    <g>
+      <circle cx="60" cy="380" r="6" fill="#38a169"/>
+      <text x="78" y="377" class="pin-label">SDO (MISO)</text>
+      <text x="78" y="392" class="pin-sub">GPIO9 · 물리핀 21번</text>
+    </g>
+
+    <line x1="30" y1="425" x2="270" y2="425" stroke="#cbd5e0" stroke-width="1" stroke-dasharray="3,3"/>
+    <text x="150" y="445" text-anchor="middle" class="pin-sub" font-weight="700">↓ 개별 CS (모듈별로 다른 핀) ↓</text>
+
+    <g>
+      <circle cx="60" cy="470" r="6" fill="#805ad5"/>
+      <text x="78" y="467" class="pin-label">CS1</text>
+      <text x="78" y="482" class="pin-sub">GPIO5 (board.D5) · 물리핀 29번</text>
+    </g>
+    <g>
+      <circle cx="60" cy="540" r="6" fill="#d53f8c"/>
+      <text x="78" y="537" class="pin-label">CS2</text>
+      <text x="78" y="552" class="pin-sub">GPIO6 (board.D6) · 물리핀 31번</text>
+    </g>
+    <g>
+      <circle cx="60" cy="610" r="6" fill="#dd6b20"/>
+      <text x="78" y="607" class="pin-label">CS3</text>
+      <text x="78" y="622" class="pin-sub">GPIO13 (board.D13) · 물리핀 33번</text>
+    </g>
+    <g>
+      <circle cx="60" cy="680" r="6" fill="#2c7a7b"/>
+      <text x="78" y="677" class="pin-label">CS4</text>
+      <text x="78" y="692" class="pin-sub">GPIO19 (board.D19) · 물리핀 35번</text>
+    </g>
+
+    <!-- ===== Modules ===== -->
+    <text x="980" y="34" text-anchor="middle" class="section-tag">MAX31856 모듈 4개 (열전대 1~4)</text>
+
+    <!-- module boxes at x=830, width=340, 4 rows -->
+    <!-- module y centers: 130, 300, 470, 640, each box height 130 -->
+
+    <!-- module CS y-lines match Pi CS rows: mod1->470, mod2->540 but modules stacked differently.
+         We'll position module CS pins to align roughly with their own trunk line, not necessarily same y as Pi CS.
+    -->
+
+    <!-- Module 1 -->
+    <rect x="830" y="70" width="340" height="120" rx="10" fill="#faf5ff" stroke="#805ad5" stroke-width="1.8"/>
+    <text x="1000" y="94" text-anchor="middle" class="mod-title" fill="#553c9a">모듈 1 (열전대 CH1)</text>
+    <text x="855" y="118" class="mod-pin">VIN</text>
+    <text x="915" y="118" class="mod-pin">GND</text>
+    <text x="975" y="118" class="mod-pin">SCK</text>
+    <text x="1035" y="118" class="mod-pin">SDI</text>
+    <text x="1095" y="118" class="mod-pin">SDO</text>
+    <text x="855" y="160" class="mod-pin" font-weight="700" fill="#553c9a">CS →</text>
+    <circle cx="860" cy="140" r="4" fill="#e53e3e"/>
+    <circle cx="920" cy="140" r="4" fill="#1a202c"/>
+    <circle cx="980" cy="140" r="4" fill="#d69e2e"/>
+    <circle cx="1040" cy="140" r="4" fill="#3182ce"/>
+    <circle cx="1100" cy="140" r="4" fill="#38a169"/>
+    <circle cx="1140" cy="160" r="4" fill="#805ad5"/>
+
+    <!-- Module 2 -->
+    <rect x="830" y="230" width="340" height="120" rx="10" fill="#fff5f7" stroke="#d53f8c" stroke-width="1.8"/>
+    <text x="1000" y="254" text-anchor="middle" class="mod-title" fill="#97266d">모듈 2 (열전대 CH2)</text>
+    <circle cx="860" cy="300" r="4" fill="#e53e3e"/>
+    <circle cx="920" cy="300" r="4" fill="#1a202c"/>
+    <circle cx="980" cy="300" r="4" fill="#d69e2e"/>
+    <circle cx="1040" cy="300" r="4" fill="#3182ce"/>
+    <circle cx="1100" cy="300" r="4" fill="#38a169"/>
+    <circle cx="1140" cy="320" r="4" fill="#d53f8c"/>
+    <text x="1105" y="320" class="mod-pin" font-weight="700" fill="#97266d" text-anchor="end">CS →</text>
+
+    <!-- Module 3 -->
+    <rect x="830" y="390" width="340" height="120" rx="10" fill="#fffaf0" stroke="#dd6b20" stroke-width="1.8"/>
+    <text x="1000" y="414" text-anchor="middle" class="mod-title" fill="#9c4221">모듈 3 (열전대 CH3)</text>
+    <circle cx="860" cy="460" r="4" fill="#e53e3e"/>
+    <circle cx="920" cy="460" r="4" fill="#1a202c"/>
+    <circle cx="980" cy="460" r="4" fill="#d69e2e"/>
+    <circle cx="1040" cy="460" r="4" fill="#3182ce"/>
+    <circle cx="1100" cy="460" r="4" fill="#38a169"/>
+    <circle cx="1140" cy="480" r="4" fill="#dd6b20"/>
+    <text x="1105" y="480" class="mod-pin" font-weight="700" fill="#9c4221" text-anchor="end">CS →</text>
+
+    <!-- Module 4 -->
+    <rect x="830" y="550" width="340" height="120" rx="10" fill="#f0fdfa" stroke="#2c7a7b" stroke-width="1.8"/>
+    <text x="1000" y="574" text-anchor="middle" class="mod-title" fill="#234e52">모듈 4 (열전대 CH4)</text>
+    <circle cx="860" cy="620" r="4" fill="#e53e3e"/>
+    <circle cx="920" cy="620" r="4" fill="#1a202c"/>
+    <circle cx="980" cy="620" r="4" fill="#d69e2e"/>
+    <circle cx="1040" cy="620" r="4" fill="#3182ce"/>
+    <circle cx="1100" cy="620" r="4" fill="#38a169"/>
+    <circle cx="1140" cy="640" r="4" fill="#2c7a7b"/>
+    <text x="1105" y="640" class="mod-pin" font-weight="700" fill="#234e52" text-anchor="end">CS →</text>
+
+    <!-- ===== Shared bus trunk lines (VIN, GND, SCK, SDI, SDO) ===== -->
+    <!-- trunk vertical x positions -->
+    <line x1="66" y1="100" x2="470" y2="100" stroke="#e53e3e" stroke-width="1.6"/>
+    <line x1="470" y1="100" x2="470" y2="700" stroke="#e53e3e" stroke-width="1.6"/>
+    <line x1="470" y1="140" x2="860" y2="140" stroke="#e53e3e" stroke-width="1.6"/>
+    <line x1="470" y1="300" x2="860" y2="300" stroke="#e53e3e" stroke-width="1.6"/>
+    <line x1="470" y1="460" x2="860" y2="460" stroke="#e53e3e" stroke-width="1.6"/>
+    <line x1="470" y1="620" x2="860" y2="620" stroke="#e53e3e" stroke-width="1.6"/>
+
+    <line x1="66" y1="170" x2="500" y2="170" stroke="#1a202c" stroke-width="1.6"/>
+    <line x1="500" y1="170" x2="500" y2="700" stroke="#1a202c" stroke-width="1.6"/>
+    <line x1="500" y1="140" x2="920" y2="140" stroke="#1a202c" stroke-width="1.6"/>
+    <line x1="500" y1="300" x2="920" y2="300" stroke="#1a202c" stroke-width="1.6"/>
+    <line x1="500" y1="460" x2="920" y2="460" stroke="#1a202c" stroke-width="1.6"/>
+    <line x1="500" y1="620" x2="920" y2="620" stroke="#1a202c" stroke-width="1.6"/>
+
+    <line x1="66" y1="240" x2="530" y2="240" stroke="#d69e2e" stroke-width="1.6"/>
+    <line x1="530" y1="240" x2="530" y2="700" stroke="#d69e2e" stroke-width="1.6"/>
+    <line x1="530" y1="140" x2="980" y2="140" stroke="#d69e2e" stroke-width="1.6"/>
+    <line x1="530" y1="300" x2="980" y2="300" stroke="#d69e2e" stroke-width="1.6"/>
+    <line x1="530" y1="460" x2="980" y2="460" stroke="#d69e2e" stroke-width="1.6"/>
+    <line x1="530" y1="620" x2="980" y2="620" stroke="#d69e2e" stroke-width="1.6"/>
+
+    <line x1="66" y1="310" x2="560" y2="310" stroke="#3182ce" stroke-width="1.6"/>
+    <line x1="560" y1="310" x2="560" y2="700" stroke="#3182ce" stroke-width="1.6"/>
+    <line x1="560" y1="140" x2="1040" y2="140" stroke="#3182ce" stroke-width="1.6"/>
+    <line x1="560" y1="300" x2="1040" y2="300" stroke="#3182ce" stroke-width="1.6"/>
+    <line x1="560" y1="460" x2="1040" y2="460" stroke="#3182ce" stroke-width="1.6"/>
+    <line x1="560" y1="620" x2="1040" y2="620" stroke="#3182ce" stroke-width="1.6"/>
+
+    <line x1="66" y1="380" x2="590" y2="380" stroke="#38a169" stroke-width="1.6"/>
+    <line x1="590" y1="380" x2="590" y2="700" stroke="#38a169" stroke-width="1.6"/>
+    <line x1="590" y1="140" x2="1100" y2="140" stroke="#38a169" stroke-width="1.6"/>
+    <line x1="590" y1="300" x2="1100" y2="300" stroke="#38a169" stroke-width="1.6"/>
+    <line x1="590" y1="460" x2="1100" y2="460" stroke="#38a169" stroke-width="1.6"/>
+    <line x1="590" y1="620" x2="1100" y2="620" stroke="#38a169" stroke-width="1.6"/>
+
+    <!-- ===== Individual CS lines (1:1, no branching) ===== -->
+    <path d="M 66,470 C 650,470 700,160 1140,160" stroke="#805ad5" stroke-width="1.8" fill="none"/>
+    <path d="M 66,540 C 700,540 750,320 1140,320" stroke="#d53f8c" stroke-width="1.8" fill="none"/>
+    <path d="M 66,610 C 720,610 780,480 1140,480" stroke="#dd6b20" stroke-width="1.8" fill="none"/>
+    <path d="M 66,680 C 700,680 750,640 1140,640" stroke="#2c7a7b" stroke-width="1.8" fill="none"/>
+
+  </svg>
+
+  <div class="legend">
+    <div class="legend-item"><span class="swatch" style="background:#e53e3e"></span>VIN (3.3V, 공유)</div>
+    <div class="legend-item"><span class="swatch" style="background:#1a202c"></span>GND (공유)</div>
+    <div class="legend-item"><span class="swatch" style="background:#d69e2e"></span>SCK (공유)</div>
+    <div class="legend-item"><span class="swatch" style="background:#3182ce"></span>SDI/MOSI (공유)</div>
+    <div class="legend-item"><span class="swatch" style="background:#38a169"></span>SDO/MISO (공유)</div>
+    <div class="legend-item"><span class="swatch" style="background:#805ad5"></span>CS1 (개별)</div>
+    <div class="legend-item"><span class="swatch" style="background:#d53f8c"></span>CS2 (개별)</div>
+    <div class="legend-item"><span class="swatch" style="background:#dd6b20"></span>CS3 (개별)</div>
+    <div class="legend-item"><span class="swatch" style="background:#2c7a7b"></span>CS4 (개별)</div>
+  </div>
+</div>
+</body>
+</html>

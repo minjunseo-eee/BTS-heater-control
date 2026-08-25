@@ -1,0 +1,3 @@
+pyserial
+adafruit-circuitpython-max31856
+matplotlib
