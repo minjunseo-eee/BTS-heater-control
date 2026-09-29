@@ -332,19 +332,23 @@ def main():
 
     thermocouples = init_thermocouples()
 
-    # --- 주변온도 측정 (출력 ON 이전) ---
-    t_amb = measure_ambient(thermocouples)
-    if t_amb is None:
-        print("[오류] 주변온도를 측정하지 못했습니다. 열전대 연결을 확인하세요.")
-        sys.exit(1)
-    print(f"[준비] 주변온도 T_amb = {t_amb:.2f}C")
-
+    # 원본과 같은 순서: 시리얼 연결 -> 0V로 출력 ON -> 그 다음 온도 읽기
+    # (0V라서 가열은 시작되지 않으므로 주변온도 측정에 영향 없음)
     ser = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=1)
     send_scpi(ser, "CONF:REM ON")
     send_scpi(ser, f"SOUR:CURR {CURRENT_LIMIT}")
 
     current_voltage = set_voltage(ser, VOLTAGE_MIN)
     send_scpi(ser, "CONF:OUTP ON")
+
+    # --- 주변온도 측정 (출력 0V, 가열 시작 전) ---
+    t_amb = measure_ambient(thermocouples)
+    if t_amb is None:
+        print("[오류] 주변온도를 측정하지 못했습니다. 열전대 연결을 확인하세요.")
+        send_scpi(ser, "CONF:OUTP OFF")
+        ser.close()
+        sys.exit(1)
+    print(f"[준비] 주변온도 T_amb = {t_amb:.2f}C")
 
     pid = PID(KP, KI, KD, INTEGRAL_LIMIT)
 
