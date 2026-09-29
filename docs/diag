@@ -1,0 +1,131 @@
+"""
+하드웨어 진단 스크립트 (출력은 절대 켜지 않음)
+
+확인 항목
+ 1) SPI 장치 존재 (/dev/spidev*)
+ 2) 전원장치 시리얼 통신 (포트, 속도 38400/9600, FETC:VOLT? 응답)
+ 3) 열전대 채널별 SPI 응답 / 온도 / fault  (채널마다 별도 프로세스 + 타임아웃이라 멈춰도 다음 채널로 진행)
+
+실행:  python3 diag_check.py
+"""
+import glob
+import subprocess
+import sys
+import time
+
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUDS = [38400, 9600]
+CH_PINS = {"CH1": "D5", "CH2": "D6", "CH3": "D13", "CH4": "D19"}
+CH_TIMEOUT_S = 10
+
+
+def child(name):
+    """채널 하나만 검사 (자식 프로세스). 멈추면 부모가 타임아웃으로 죽임."""
+    import board
+    import digitalio
+    import adafruit_max31856
+
+    cs = digitalio.DigitalInOut(getattr(board, CH_PINS[name]))
+    tc = adafruit_max31856.MAX31856(board.SPI(), cs, thermocouple_type=adafruit_max31856.ThermocoupleType.K)
+    cr0 = tc._read_register(0x00, 1).hex()
+    cr1 = tc._read_register(0x01, 1).hex()
+    print(f"    레지스터 CR0={cr0} CR1={cr1}", flush=True)
+    t0 = time.time()
+    temp = tc.temperature
+    print(f"    온도={temp:.2f}C (읽는 데 {time.time()-t0:.2f}s)", flush=True)
+    print(f"    cold-junction={tc.reference_temperature:.2f}C", flush=True)
+    faults = {k: v for k, v in tc.fault.items() if v}
+    print(f"    fault={faults if faults else '없음'}", flush=True)
+
+
+def check_spi():
+    print("[1] SPI 장치")
+    devs = glob.glob("/dev/spidev*")
+    if devs:
+        print(f"    OK  {sorted(devs)}")
+    else:
+        print("    문제: /dev/spidev* 없음 -> sudo raspi-config 에서 SPI 활성화 필요")
+
+
+def check_serial():
+    print("[2] 전원장치 시리얼")
+    try:
+        import serial
+    except ImportError:
+        print("    pyserial 미설치")
+        return
+    ports = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+    print(f"    발견된 포트: {ports if ports else '없음 (USB-시리얼 어댑터/케이블 확인)'}")
+    for baud in BAUDS:
+        try:
+            ser = serial.Serial(SERIAL_PORT, baud, timeout=1)
+        except Exception as e:
+            print(f"    {SERIAL_PORT} @ {baud} 열기 실패: {e}")
+            return
+        try:
+            ser.reset_input_buffer()
+            ser.write(b"CONF:REM ON\n")
+            time.sleep(0.2)
+            ser.write(b"FETC:VOLT?\n")
+            time.sleep(0.3)
+            resp = ser.readline().decode(errors="ignore").strip()
+            ser.write(b"FETC:CURR?\n")
+            time.sleep(0.3)
+            resp_i = ser.readline().decode(errors="ignore").strip()
+        finally:
+            ser.close()
+        ok = bool(resp)
+        print(f"    @ {baud}: V응답={resp!r} I응답={resp_i!r}  -> {'OK' if ok else '응답 없음'}")
+        if ok:
+            print(f"    => 이 속도({baud})로 통신 가능. 코드 SERIAL_BAUDRATE 가 {baud} 인지 확인")
+            return
+    print("    문제: 어느 속도에서도 응답 없음 -> 케이블(크로스/스트레이트), 전원장치 RS-232 설정, 포트 확인")
+
+
+def check_thermocouples():
+    print("[3] 열전대 채널 (채널당 최대 %ds)" % CH_TIMEOUT_S)
+    results = {}
+    for name in CH_PINS:
+        print(f"  {name} (CS={CH_PINS[name]})")
+        try:
+            r = subprocess.run(
+                [sys.executable, __file__, "--child", name],
+                timeout=CH_TIMEOUT_S, capture_output=True, text=True,
+            )
+            print(r.stdout, end="")
+            if r.returncode != 0:
+                print("    오류:", (r.stderr.strip().splitlines() or ["?"])[-1])
+                results[name] = "오류"
+            else:
+                results[name] = "OK"
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            print(out, end="")
+            print(f"    문제: {CH_TIMEOUT_S}초 안에 온도를 못 읽음 (SPI 무응답/멈춤)")
+            results[name] = "멈춤"
+    return results
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--child":
+        child(sys.argv[2])
+        return
+    print("=== 진단 시작 (전원장치 출력은 켜지 않습니다) ===\n")
+    check_spi()
+    print()
+    check_serial()
+    print()
+    res = check_thermocouples()
+    print("\n=== 요약 ===")
+    print("열전대:", res)
+    bad = [k for k, v in res.items() if v != "OK"]
+    if len(bad) == len(res):
+        print("전 채널 이상 -> 공통 원인: 모듈 전원(3.3V)/GND, SPI 배선(MISO/MOSI/SCLK) 또는 SPI 비활성화")
+    elif bad:
+        print(f"{bad} 만 이상 -> 그 채널의 CS 배선/모듈/열전대 연결 확인")
+    else:
+        print("열전대 전 채널 정상")
+
+
+if __name__ == "__main__":
+    main()
