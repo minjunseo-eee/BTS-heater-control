@@ -1,0 +1,629 @@
+"""
+면상 발열체 온도 제어 (4채널 열전대 + Chroma 62000P + 멱평균 대푯온도 PID)
+
+- 제어 입력  : 멱평균 대푯온도 T_rep(p)   (p는 실행 인자 --p 로 선택)
+- 안전 판단  : 항상 max_i T_i  (대푯온도와 무관하게 95C 차단 / 93C 강제하강)
+
+T_rep(p) = T_amb + ( (1/N) * sum_i (T_i - T_amb)^p )^(1/p)
+    p=1 산술평균, p=2 RMS, p->inf 최댓값
+
+실행 예:
+    python3 heater_pid_prep.py --p 2
+    python3 heater_pid_prep.py --p inf --target 90
+"""
+import os
+import sys
+import time
+import csv
+import argparse
+import statistics
+import threading
+from datetime import datetime
+
+import serial
+
+import board
+import digitalio
+import adafruit_max31856
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+
+
+# ===================== 설정값 =====================
+
+TARGET_TEMP_C = 90.0  # 대푯온도 T_rep 의 목표값 (--target 으로 변경 가능)
+
+# 멱평균 지수: 로그에는 항상 이 4개를 모두 기록, 제어에는 --p 로 고른 하나만 사용
+P_LIST = [1, 2, 4, float("inf")]
+P_CONTROL_DEFAULT = 2
+
+# 제어 게인 (SIMC 튜닝값, 논문 2.3절과 일치시킬 것)
+KP = 0.442
+KI = KP / 68
+KD = KP * 0.5
+
+VOLTAGE_MAX = 24.0
+VOLTAGE_MIN = 0.0
+
+INTEGRAL_LIMIT = VOLTAGE_MAX / KI
+CURRENT_LIMIT = 5.0
+
+MAX_VOLTAGE_STEP_PER_LOOP = 2.0
+
+# 안전 (항상 max 채널 기준)
+DROP_TRIGGER_TEMP_C = 93.0
+DROP_STEP_VOLTAGE = 1.0
+HARD_SAFETY_CUTOFF_C = 95.0
+
+LOG_INTERVAL_SECONDS = 2.0
+MAX_TOTAL_SECONDS = 45 * 60
+
+MAX_PLAUSIBLE_RATE_C_PER_S = 3.0
+FAULT_CEILING_C = 150.0
+WATCHDOG_TIMEOUT_SECONDS = 15.0
+
+# 시작 전 주변온도 측정: 출력 OFF 상태에서 이 횟수만큼 읽어 중앙값 사용
+AMBIENT_SAMPLES = 5
+
+# 요약 통계에 사용할 "정상상태" 구간 길이(초): 종료 직전 이 시간
+STEADY_WINDOW_S = 120.0
+
+DEBUG = False  # True면 단계별 디버그 출력 (멈추는 지점 찾을 때만)
+
+SERIAL_PORT = "/dev/ttyUSB0"
+SERIAL_BAUDRATE = 38400
+
+CS_PINS = {
+    "CH1": board.D5,
+    "CH2": board.D6,
+    "CH3": board.D13,
+    "CH4": board.D19,
+}
+CH_NAMES = ["CH1", "CH2", "CH3", "CH4"]
+
+# ===================== 한글 폰트 설정 =====================
+
+_KOREAN_FONT_CANDIDATES = [
+    "NanumGothic", "NanumBarunGothic", "Noto Sans CJK KR", "Noto Sans KR", "UnDotum",
+]
+_installed_fonts = {f.name for f in font_manager.fontManager.ttflist}
+KOREAN_FONT_AVAILABLE = False
+for _name in _KOREAN_FONT_CANDIDATES:
+    if _name in _installed_fonts:
+        matplotlib.rcParams["font.family"] = _name
+        KOREAN_FONT_AVAILABLE = True
+        break
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+if not KOREAN_FONT_AVAILABLE:
+    print(
+        "[안내] 한글 폰트를 찾지 못해 그래프 라벨을 영문으로 표시합니다.\n"
+        "       sudo apt-get install -y fonts-nanum && rm -rf ~/.cache/matplotlib"
+    )
+
+
+# ===================== 대푯온도 (멱평균) =====================
+
+
+def p_label(p):
+    return "inf" if p == float("inf") else f"{p:g}"
+
+
+def representative_temp(temps, t_amb, p):
+    """정규화 p-노름(멱평균) 대푯온도.
+
+    temps : 신뢰 가능한 채널 온도 리스트 [C]
+    t_amb : 주변온도 [C]   (편차 기준점)
+    p     : 1 이상 실수 또는 inf
+
+    주의: numpy.linalg.norm 은 1/N 정규화가 없어 채널 수에 따라 값이 커지므로 쓰지 않는다.
+    """
+    d = [max(0.0, t - t_amb) for t in temps]  # 주변온도 이하는 0으로 (음수 거듭제곱 방지)
+    if not d:
+        return None
+    if p == float("inf"):
+        return t_amb + max(d)
+    return t_amb + (sum(x ** p for x in d) / len(d)) ** (1.0 / p)
+
+
+# ===================== 하드웨어 초기화 / 통신 =====================
+
+
+def init_thermocouples():
+    spi = board.SPI()
+    thermocouples = {}
+    for name, pin in CS_PINS.items():
+        cs = digitalio.DigitalInOut(pin)
+        tc = adafruit_max31856.MAX31856(
+            spi, cs, thermocouple_type=adafruit_max31856.ThermocoupleType.K
+        )
+        thermocouples[name] = tc
+        print(f"[OK] {name} 모듈 초기화 성공 (CS={pin})")
+    return thermocouples
+
+
+def read_all_channels(thermocouples):
+    temps = {}
+    faulted = set()
+    for name, tc in thermocouples.items():
+        try:
+            if DEBUG:
+                print(f"[디버그]   {name} .temperature 읽기 시작", flush=True)
+            temp = tc.temperature
+            fault = tc.fault
+            temps[name] = temp
+            if any(fault.values()):
+                faulted.add(name)
+                active = [k for k, v in fault.items() if v]
+                print(f"[경고] {name} fault 감지({','.join(active)}) - 안전판단에서 제외")
+        except Exception as e:
+            print(f"[경고] {name} 읽기 실패: {e}")
+            temps[name] = None
+            faulted.add(name)
+    return temps, faulted
+
+
+def measure_ambient(thermocouples):
+    """출력 ON 이전에 주변온도(발열체 초기온도)를 측정. 여러 번 읽어 중앙값 사용."""
+    samples = []
+    for _ in range(AMBIENT_SAMPLES):
+        temps, faulted = read_all_channels(thermocouples)
+        vals = [
+            v for k, v in temps.items()
+            if v is not None and k not in faulted and v < FAULT_CEILING_C
+        ]
+        if vals:
+            samples.append(statistics.mean(vals))
+        time.sleep(0.5)
+    if not samples:
+        return None
+    return statistics.median(samples)
+
+
+def send_scpi(ser, command):
+    ser.write((command + "\n").encode())
+    time.sleep(0.05)
+
+
+def query_scpi(ser, command):
+    ser.write((command + "\n").encode())
+    time.sleep(0.1)
+    return ser.readline().decode(errors="ignore").strip()
+
+
+def set_voltage(ser, voltage):
+    voltage = max(VOLTAGE_MIN, min(voltage, VOLTAGE_MAX))
+    send_scpi(ser, f"SOUR:VOLT {voltage:.2f}")
+    return voltage
+
+
+def to_float(s):
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+# ===================== PID 컨트롤러 =====================
+
+
+class PID:
+    def __init__(self, kp, ki, kd, integral_limit):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.integral_limit = integral_limit
+        self.integral = 0.0
+        self.prev_measurement = None
+
+    def compute(self, setpoint, measurement, dt, output_saturated_high, output_saturated_low):
+        error = setpoint - measurement
+
+        # 안티와인드업(조건부 적분): 출력이 포화된 방향으로 오차가 더 미는 중이면 적분 정지
+        would_wind_further = (output_saturated_high and error > 0) or (
+            output_saturated_low and error < 0
+        )
+        if not would_wind_further and dt > 0:
+            self.integral += error * dt
+            self.integral = max(-self.integral_limit, min(self.integral_limit, self.integral))
+
+        # 미분항은 오차가 아니라 측정값에 대해 계산 (미분 킥 방지)
+        if self.prev_measurement is None or dt <= 0:
+            derivative = 0.0
+        else:
+            derivative = -(measurement - self.prev_measurement) / dt
+        self.prev_measurement = measurement
+
+        p_term = self.kp * error
+        i_term = self.ki * self.integral
+        d_term = self.kd * derivative
+
+        return p_term + i_term + d_term, error, p_term, i_term, d_term
+
+
+# ===================== 워치독 =====================
+
+
+def watchdog_thread_func(heartbeat, stop_event):
+    """메인 루프가 SPI 등에서 멈춰도 무조건 출력을 끄는 독립 감시 스레드."""
+    try:
+        wd_ser = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=1)
+    except Exception as e:
+        print(f"[워치독] 감시용 시리얼 연결 실패({e}) - 워치독 비활성화 상태로 진행됩니다", flush=True)
+        return
+
+    try:
+        while not stop_event.is_set():
+            time.sleep(1.0)
+            idle = time.monotonic() - heartbeat["t"]
+            if idle > WATCHDOG_TIMEOUT_SECONDS:
+                print(
+                    f"\n[워치독-비상] 메인 루프가 {idle:.1f}초 동안 응답이 없습니다! "
+                    f"독립적으로 강제 출력 OFF 처리합니다.",
+                    flush=True,
+                )
+                for _ in range(3):
+                    try:
+                        wd_ser.write(b"CONF:OUTP OFF\n")
+                        wd_ser.flush()
+                    except Exception as e:
+                        print(f"[워치독] 출력 OFF 명령 전송 실패: {e}", flush=True)
+                    time.sleep(0.2)
+                print("[워치독-비상] 출력 OFF 전송 완료. 프로세스를 강제 종료합니다.", flush=True)
+                try:
+                    wd_ser.close()
+                except Exception:
+                    pass
+                os._exit(1)
+    finally:
+        try:
+            wd_ser.close()
+        except Exception:
+            pass
+
+
+# ===================== CSV 컬럼 =====================
+
+CSV_HEADER = (
+    ["elapsed_s", "dt_s"]
+    + [f"{c.lower()}_temp_c" for c in CH_NAMES]
+    + ["t_amb_c", "max_temp_c", "max_channel"]
+    + [f"t_rep_p{p_label(p)}_c" for p in P_LIST]
+    + ["p_control", "t_ctrl_c", "error_c", "p_term", "i_term", "d_term",
+       "voltage_command", "voltage_meas", "current_meas", "power_meas", "energy_wh"]
+)
+# 인덱스 (save_plot / summarize 에서 사용)
+IDX = {name: i for i, name in enumerate(CSV_HEADER)}
+
+
+def make_row(elapsed, dt, temps, t_amb, max_temp, max_channel, t_reps, p_ctrl, t_ctrl,
+             error, p_term, i_term, d_term, v_cmd, v_meas, c_meas, p_meas, energy_wh):
+    return (
+        [round(elapsed, 2), round(dt, 3)]
+        + [temps.get(c) for c in CH_NAMES]
+        + [t_amb, max_temp, max_channel]
+        + [t_reps.get(p) if t_reps else None for p in P_LIST]
+        + [p_label(p_ctrl), t_ctrl, error, p_term, i_term, d_term,
+           v_cmd, v_meas, c_meas, p_meas, energy_wh]
+    )
+
+
+# ===================== 메인 로직 =====================
+
+
+def main():
+    parser = argparse.ArgumentParser(description="멱평균 대푯온도 기반 PID 온도 제어")
+    parser.add_argument("--p", default=str(P_CONTROL_DEFAULT),
+                        help="제어에 쓸 멱평균 지수 (1, 2, 4, inf 등). 기본 2")
+    parser.add_argument("--target", type=float, default=TARGET_TEMP_C,
+                        help="대푯온도 목표 [C]")
+    args = parser.parse_args()
+
+    p_ctrl = float("inf") if args.p.lower() in ("inf", "max") else float(args.p)
+    if p_ctrl < 1:
+        print("[오류] p는 1 이상이어야 합니다.")
+        sys.exit(1)
+    target = args.target
+    if p_ctrl not in P_LIST:
+        print(f"[안내] p={args.p} 는 로그용 P_LIST에 없어 T_ctrl 열에만 기록됩니다.")
+
+    thermocouples = init_thermocouples()
+
+    # --- 주변온도 측정 (출력 ON 이전) ---
+    t_amb = measure_ambient(thermocouples)
+    if t_amb is None:
+        print("[오류] 주변온도를 측정하지 못했습니다. 열전대 연결을 확인하세요.")
+        sys.exit(1)
+    print(f"[준비] 주변온도 T_amb = {t_amb:.2f}C")
+
+    ser = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=1)
+    send_scpi(ser, "CONF:REM ON")
+    send_scpi(ser, f"SOUR:CURR {CURRENT_LIMIT}")
+
+    current_voltage = set_voltage(ser, VOLTAGE_MIN)
+    send_scpi(ser, "CONF:OUTP ON")
+
+    pid = PID(KP, KI, KD, INTEGRAL_LIMIT)
+
+    heartbeat = {"t": time.monotonic()}
+    stop_event = threading.Event()
+    watchdog = threading.Thread(
+        target=watchdog_thread_func, args=(heartbeat, stop_event), daemon=True
+    )
+    watchdog.start()
+    print(f"[워치독] 감시 시작 (메인 루프가 {WATCHDOG_TIMEOUT_SECONDS:.0f}초 이상 멈추면 강제 출력 OFF)")
+
+    print(f"[시작] PID 제어, 입력=T_rep(p={p_label(p_ctrl)}), 목표 {target:.1f}C, 전압상한 {VOLTAGE_MAX}V")
+    print(f"[게인] Kp={KP:.4f} Ki={KI:.6f} Kd={KD:.4f}")
+    print(f"[안전] 93C 강제하강 / 95C 차단은 max 채널 기준\n")
+
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_filename = f"pid_p{p_label(p_ctrl)}_{target:.0f}c_{timestamp_str}.csv"
+
+    rows = []
+    start_time = time.monotonic()
+    last_time = start_time
+    output_on = True
+    energy_wh = 0.0
+
+    last_valid_temp = {}
+    last_valid_time = {}
+
+    try:
+        with open(csv_filename, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_HEADER)
+
+            while True:
+                now = time.monotonic()
+                elapsed = now - start_time
+                dt = now - last_time
+                last_time = now
+                heartbeat["t"] = now
+
+                if elapsed > MAX_TOTAL_SECONDS:
+                    print(f"[종료] 최대 세션 시간({MAX_TOTAL_SECONDS}s) 도달")
+                    break
+
+                temps, faulted = read_all_channels(thermocouples)
+
+                # --- 글리치(물리적으로 불가능한 급변) 필터링 ---
+                for name in list(temps.keys()):
+                    val = temps.get(name)
+                    if val is None or name in faulted:
+                        continue
+                    prev_val = last_valid_temp.get(name)
+                    prev_t = last_valid_time.get(name)
+                    if prev_val is not None and prev_t is not None:
+                        dt_ch = now - prev_t
+                        if dt_ch > 0:
+                            rate = abs(val - prev_val) / dt_ch
+                            if rate > MAX_PLAUSIBLE_RATE_C_PER_S:
+                                print(
+                                    f"[경고] {name} 글리치 의심(변화율 {rate:.2f}C/s) - "
+                                    f"이번 값 버리고 직전값 {prev_val:.2f}C 유지",
+                                    flush=True,
+                                )
+                                temps[name] = prev_val
+                                continue
+                    last_valid_temp[name] = val
+                    last_valid_time[name] = now
+
+                readable_temps = {k: v for k, v in temps.items() if v is not None}
+                if not readable_temps:
+                    print("[비상차단] 모든 채널 읽기 실패, 안전을 위해 출력 차단")
+                    send_scpi(ser, "CONF:OUTP OFF")
+                    output_on = False
+                    break
+
+                trustworthy_temps = {
+                    k: v for k, v in readable_temps.items() if k not in faulted
+                }
+
+                if not trustworthy_temps:
+                    print("[비상차단] 모든 채널이 fault 상태 - 즉시 출력 OFF")
+                    send_scpi(ser, "CONF:OUTP OFF")
+                    output_on = False
+                    row = make_row(elapsed, dt, temps, t_amb, None, None, None, p_ctrl, None,
+                                   None, None, None, None, None, None, None, None, energy_wh)
+                    rows.append(row)
+                    writer.writerow(row)
+                    break
+
+                max_channel = max(trustworthy_temps, key=trustworthy_temps.get)
+                max_temp = trustworthy_temps[max_channel]
+
+                # --- 최후 안전장치: 95도 도달 시 즉시 차단 (max 기준) ---
+                if max_temp >= HARD_SAFETY_CUTOFF_C:
+                    print(f"[안전차단] {max_channel} {max_temp:.2f}C >= {HARD_SAFETY_CUTOFF_C}C, 즉시 출력 OFF")
+                    send_scpi(ser, "CONF:OUTP OFF")
+                    output_on = False
+                    row = make_row(elapsed, dt, temps, t_amb, max_temp, max_channel, None,
+                                   p_ctrl, None, None, None, None, None, current_voltage,
+                                   None, None, None, energy_wh)
+                    rows.append(row)
+                    writer.writerow(row)
+                    break
+
+                # --- 멱평균 대푯온도 계산 (로그용 전체 p + 제어용 1개) ---
+                vals = list(trustworthy_temps.values())
+                t_reps = {p: representative_temp(vals, t_amb, p) for p in P_LIST}
+                t_ctrl = representative_temp(vals, t_amb, p_ctrl)
+
+                # --- PID 계산 (입력: 대푯온도) ---
+                output_saturated_high = current_voltage >= VOLTAGE_MAX
+                output_saturated_low = current_voltage <= VOLTAGE_MIN
+                pid_output, error, p_term, i_term, d_term = pid.compute(
+                    target, t_ctrl, dt, output_saturated_high, output_saturated_low
+                )
+
+                # --- 슬루레이트 제한 ---
+                voltage_step = max(
+                    -MAX_VOLTAGE_STEP_PER_LOOP,
+                    min(MAX_VOLTAGE_STEP_PER_LOOP, pid_output - current_voltage),
+                )
+                current_voltage = set_voltage(ser, current_voltage + voltage_step)
+
+                # --- 93도 도달 시 PID와 무관하게 강제 1V 하강 (max 기준) ---
+                if max_temp >= DROP_TRIGGER_TEMP_C and current_voltage > VOLTAGE_MIN:
+                    forced_voltage = max(VOLTAGE_MIN, current_voltage - DROP_STEP_VOLTAGE)
+                    current_voltage = set_voltage(ser, forced_voltage)
+                    print(f"[강제하강] {max_channel} {max_temp:.2f}C >= {DROP_TRIGGER_TEMP_C}C "
+                          f"-> 전압 {current_voltage:.2f}V")
+
+                v_meas = to_float(query_scpi(ser, "FETC:VOLT?"))
+                c_meas = to_float(query_scpi(ser, "FETC:CURR?"))
+                p_meas = to_float(query_scpi(ser, "FETC:POW?"))
+
+                # --- 소비 에너지 적산 [Wh] (실측 전력 사용, 없으면 V*I, 그것도 없으면 0) ---
+                power = p_meas
+                if power is None and v_meas is not None and c_meas is not None:
+                    power = v_meas * c_meas
+                energy_wh += (power or 0.0) * dt / 3600.0
+
+                row = make_row(elapsed, dt, temps, t_amb, max_temp, max_channel, t_reps,
+                               p_ctrl, t_ctrl, error, p_term, i_term, d_term,
+                               current_voltage, v_meas, c_meas, p_meas, energy_wh)
+                rows.append(row)
+                writer.writerow(row)
+                f.flush()
+
+                def fmt_ch(k):
+                    if temps.get(k) is None:
+                        return f"{k}=X"
+                    return f"{k}={temps[k]:.1f}{'!' if k in faulted else ''}"
+
+                temp_str = " ".join(fmt_ch(k) for k in CH_NAMES)
+                print(
+                    f"[{elapsed:6.1f}s] {temp_str} | max={max_temp:.1f} "
+                    f"T_rep(p{p_label(p_ctrl)})={t_ctrl:.1f} | e={error:+.2f} "
+                    f"| V={current_voltage:.2f} (P={p_term:+.2f} I={i_term:+.2f} D={d_term:+.2f}) "
+                    f"| E={energy_wh:.3f}Wh",
+                    flush=True,
+                )
+
+                sleep_time = max(0.0, LOG_INTERVAL_SECONDS - (time.monotonic() - now))
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        print("\n[중단] 사용자가 Ctrl+C로 중단함")
+    finally:
+        stop_event.set()
+        if output_on:
+            send_scpi(ser, "CONF:OUTP OFF")
+            print("[안전] 출력 OFF 처리 완료")
+        ser.close()
+
+    print(f"\nCSV 저장 완료: {csv_filename}")
+    summarize(rows, p_ctrl, target)
+    save_plot(rows, csv_filename, p_ctrl, target)
+
+
+# ===================== 요약 통계 (논문 Table 1 용) =====================
+
+
+def summarize(rows, p_ctrl, target):
+    """종료 직전 STEADY_WINDOW_S 구간의 평균으로 정상상태 지표를 계산해 출력.
+    (실험이 STEADY_WINDOW_S 이상 진행되고 정상상태에 들어간 경우에만 의미가 있음)"""
+    valid = [r for r in rows if r[IDX["t_ctrl_c"]] is not None]
+    if not valid:
+        print("[요약] 유효 데이터가 없습니다.")
+        return
+    t_end = valid[-1][IDX["elapsed_s"]]
+    win = [r for r in valid if r[IDX["elapsed_s"]] >= t_end - STEADY_WINDOW_S]
+
+    def avg(col):
+        xs = [r[IDX[col]] for r in win if r[IDX[col]] is not None]
+        return statistics.mean(xs) if xs else None
+
+    ch_means = []
+    for c in CH_NAMES:
+        m = avg(f"{c.lower()}_temp_c")
+        if m is not None and m < FAULT_CEILING_C:
+            ch_means.append(m)
+    spread = (max(ch_means) - min(ch_means)) if ch_means else None
+
+    # 목표(대푯온도) 첫 도달 시간: T_ctrl >= target - 1C
+    reach = next((r[IDX["elapsed_s"]] for r in valid if r[IDX["t_ctrl_c"]] >= target - 1.0), None)
+    peak = max(r[IDX["max_temp_c"]] for r in valid if r[IDX["max_temp_c"]] is not None)
+    t_ctrl_peak = max(r[IDX["t_ctrl_c"]] for r in valid)
+    overshoot = max(0.0, t_ctrl_peak - target)
+
+    def f(x, fmt="{:.2f}"):
+        return "N/A" if x is None else fmt.format(x)
+
+    print("\n========== 요약 (마지막 %.0fs 구간) ==========" % STEADY_WINDOW_S)
+    print(f" 제어 p            : {p_label(p_ctrl)}")
+    print(f" 목표 대푯온도     : {target:.1f} C")
+    print(f" 대푯온도 도달시간 : {f(reach, '{:.0f}')} s (목표-1C 최초 도달)")
+    print(f" 대푯온도 오버슈트 : {overshoot:.2f} C")
+    print(f" T_max (정상상태)  : {f(avg('max_temp_c'))} C   (전 구간 최고 {peak:.2f} C)")
+    print(f" T_avg (정상상태)  : {f(avg('t_rep_p1_c'))} C   (p=1 산술평균)")
+    print(f" 채널간 편차       : {f(spread)} C  (채널별 평균의 max-min)")
+    print(f" 소비 에너지       : {rows[-1][IDX['energy_wh']]:.3f} Wh")
+    print("===============================================\n")
+
+
+# ===================== 그래프 =====================
+
+
+def save_plot(rows, csv_filename, p_ctrl, target):
+    """위: CH1~CH4 + T_rep(p=제어에 쓴 값) + 목표/안전선, 아래: 전압."""
+    if not rows:
+        print("[안내] 기록된 데이터가 없어 그래프를 생성하지 않습니다.")
+        return
+
+    ko = KOREAN_FONT_AVAILABLE
+    times = [r[IDX["elapsed_s"]] for r in rows]
+
+    voltage = []
+    for r in rows:
+        vm, vc = r[IDX["voltage_meas"]], r[IDX["voltage_command"]]
+        voltage.append(vm if vm is not None else vc)
+
+    def clean(v):
+        return None if (v is None or v > FAULT_CEILING_C) else v
+
+    fig, (ax_t, ax_v) = plt.subplots(
+        2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1]}
+    )
+
+    for c in CH_NAMES:
+        col = IDX[f"{c.lower()}_temp_c"]
+        ax_t.plot(times, [clean(r[col]) for r in rows], linewidth=1.0, alpha=0.7, label=c)
+
+    ax_t.plot(times, [r[IDX["t_ctrl_c"]] for r in rows], color="black", linewidth=2.2,
+              label=f"T_rep (p={p_label(p_ctrl)})")
+
+    ax_t.axhline(target, linestyle=":", linewidth=1.2, color="gray",
+                 label=("목표 " if ko else "Target ") + f"{target:.0f}C")
+    ax_t.axhline(DROP_TRIGGER_TEMP_C, linestyle="--", linewidth=1.0, color="orange",
+                 label=("강제하강 " if ko else "Forced drop ") + f"{DROP_TRIGGER_TEMP_C:.0f}C")
+    ax_t.axhline(HARD_SAFETY_CUTOFF_C, linestyle="--", linewidth=1.0, color="red",
+                 label=("안전차단 " if ko else "Cutoff ") + f"{HARD_SAFETY_CUTOFF_C:.0f}C")
+
+    ax_t.set_ylabel("온도 (°C)" if ko else "Temperature (°C)")
+    ax_t.set_title(
+        (f"멱평균 대푯온도 PID 제어 — p={p_label(p_ctrl)}, 목표 {target:.0f}°C" if ko
+         else f"Power-mean PID control — p={p_label(p_ctrl)}, target {target:.0f}°C")
+    )
+    ax_t.grid(True, alpha=0.3)
+    ax_t.legend(loc="best", fontsize=8)
+
+    ax_v.plot(times, voltage, linewidth=1.4, label="Voltage")
+    ax_v.set_xlabel("경과 시간 (s)" if ko else "Elapsed time (s)")
+    ax_v.set_ylabel("전압 (V)" if ko else "Voltage (V)")
+    ax_v.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    out_path = csv_filename.rsplit(".", 1)[0] + ".png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"그래프 저장 완료: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
